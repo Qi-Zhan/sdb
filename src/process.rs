@@ -1,4 +1,4 @@
-use std::io::IoSliceMut;
+use std::io::{BufRead, IoSliceMut};
 
 use anyhow::Result;
 use nix::sys::personality::Persona;
@@ -13,8 +13,10 @@ use nix::{
     },
     unistd::close,
 };
+use procfs::process::{MMPermissions, MemoryMaps, Process as ProcfsProcess};
 
 use crate::breakpoint::BreakpointSite;
+use crate::debug::Dwarf;
 use crate::disassembler::print_disassemble;
 
 #[derive(Debug, Clone, Copy)]
@@ -31,6 +33,8 @@ pub struct Process {
     terminate_on_end: bool,
     state: ProcessState,
     breakpoints: Vec<BreakpointSite>,
+    target: Dwarf,
+    offset: u64,
 }
 
 impl Process {
@@ -48,7 +52,7 @@ impl Process {
                     waitpid(pid, None)?;
                     return Err(anyhow::anyhow!(content));
                 }
-                let process = Process::new(pid, true);
+                let process = Process::new(pid, true)?;
                 process.wait_on_signal()?;
                 println!("Lauched process with PID: {}", pid);
                 Ok(process)
@@ -75,7 +79,7 @@ impl Process {
     pub fn attach(pid: i32) -> Result<Self> {
         let pid = Pid::from_raw(pid);
         ptrace::attach(pid)?;
-        let process = Process::new(pid, false);
+        let process = Process::new(pid, false)?;
         process.wait_on_signal()?;
         println!("Lauched process with PID: {}", pid);
         Ok(process)
@@ -91,19 +95,33 @@ impl Process {
                 println!("Process {:?}", reason);
                 if let WaitStatus::Stopped(_, _) = reason {
                     let pc = self.get_pc()?;
-                    self.print_assembly(pc, 5)?;
+                    if self.print_source(pc, 2).is_err() {
+                        self.print_assembly(pc, 5)?;
+                    }
                 }
-                Ok(())
             }
+            // source-level step
             "step" | "s" => {
-                self.step_instruction()?;
-                let reason = self.wait_on_signal()?;
+                let reason = self.step_in()?;
+                println!("Process {:?}", reason);
+            }
+            "next" | "n" => {
+                let reason = self.step_over()?;
+                println!("Process {:?}", reason);
+            }
+            // step out
+            "finish" => {
+                let reason = self.step_out()?;
+                println!("Process {:?}", reason);
+            }
+            // instruction-level step
+            "stepi" | "si" => {
+                let reason = self.step_instruction()?;
                 println!("Process {:?}", reason);
                 if let WaitStatus::Stopped(_, _) = reason {
                     let pc = self.get_pc()?;
                     self.print_assembly(pc, 1)?;
                 }
-                Ok(())
             }
             "break" | "b" => {
                 if args.len() == 1 {
@@ -120,7 +138,22 @@ impl Process {
                             let address = if args[2].starts_with("0x") {
                                 u64::from_str_radix(&args[2][2..], 16)?
                             } else {
-                                args[2].parse::<u64>()?
+                                match args[2].parse::<u64>() {
+                                    Ok(addr) => addr,
+                                    // If parsing fails, try to resolve it as a symbol
+                                    Err(_) => {
+                                        self.target
+                                            .resolve_symbol(args[2])
+                                            .ok_or_else(|| {
+                                                anyhow::anyhow!(
+                                                    "Could not resolve symbol: {}",
+                                                    args[2]
+                                                )
+                                            })?
+                                            .0
+                                            + self.offset
+                                    }
+                                }
                             };
                             self.create_breakpoint_site(address, true)?;
                         }
@@ -147,7 +180,6 @@ impl Process {
                         }
                     }
                 }
-                Ok(())
             }
             "reg" => {
                 if args.len() > 1 {
@@ -173,9 +205,8 @@ impl Process {
                 } else {
                     println!("Usage: reg read|write <register>");
                 }
-                Ok(())
             }
-            "memory" | "mem" => self.handle_memory_command(&args[1..]),
+            "memory" | "mem" => self.handle_memory_command(&args[1..])?,
             "help" => {
                 println!("Available commands:");
                 println!("  continue (c) - Continue the process");
@@ -184,10 +215,10 @@ impl Process {
                 println!("  reg          - Read or write registers");
                 println!("  memory       - Read or write memory");
                 println!("  help - Show this help message");
-                Ok(())
             }
-            _ => Err(anyhow::anyhow!("Unknown command: {}", command)),
+            _ => return Err(anyhow::anyhow!("Unknown command: {}", command)),
         }
+        Ok(())
     }
 
     fn handle_memory_command(&self, args: &[&str]) -> Result<()> {
@@ -321,9 +352,10 @@ impl Process {
         Ok(())
     }
 
-    fn step_instruction(&mut self) -> Result<()> {
+    fn step_instruction(&mut self) -> Result<WaitStatus> {
         let pc = self.get_pc()?;
         if self.enabled_stoppoint_at_address(pc) {
+            println!("Stepping over breakpoint at {:#x}", pc);
             let bp = self
                 .breakpoints
                 .iter_mut()
@@ -331,12 +363,52 @@ impl Process {
                 .unwrap();
             bp.disable()?;
             ptrace::step(self.pid, None)?;
-            waitpid(self.pid, None)?;
+            let reason = self.wait_on_signal()?;
+            let bp = self
+                .breakpoints
+                .iter_mut()
+                .find(|bp| bp.at_address(pc) && !bp.is_enabled())
+                .unwrap();
             bp.enable()?;
+            Ok(reason)
         } else {
             ptrace::step(self.pid, None)?;
+            Ok(self.wait_on_signal()?)
         }
-        Ok(())
+    }
+
+    fn step_in(&mut self) -> Result<WaitStatus> {
+        if self.target.inline_height() > 0 {
+            self.target.simulate_inlined_step_in();
+            Ok(WaitStatus::Stopped(
+                self.pid,
+                nix::sys::signal::Signal::SIGTRAP,
+            ))
+        } else {
+            let pc = self.get_pc()?;
+            let addresses = self.target.line_range_at_address(pc);
+            let largest_address = addresses
+                .iter()
+                .max_by_key(|(_, (_, line, _))| *line)
+                .unwrap()
+                .1
+                .0;
+            while self.get_pc()? <= largest_address {
+                self.step_instruction()?;
+            }
+            Ok(WaitStatus::Stopped(
+                self.pid,
+                nix::sys::signal::Signal::SIGTRAP,
+            ))
+        }
+    }
+
+    fn step_out(&mut self) -> Result<WaitStatus> {
+        todo!()
+    }
+
+    fn step_over(&mut self) -> Result<WaitStatus> {
+        todo!()
     }
 
     fn resume(&mut self) -> Result<()> {
@@ -361,6 +433,38 @@ impl Process {
         self.pid
     }
 
+    fn print_source(&self, address: u64, max_instructions: usize) -> Result<()> {
+        let address = address - self.offset;
+        let lines = self.target.line_range_at_address(address);
+        if lines.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No source lines found for address: {:#x}",
+                address
+            ));
+        }
+        let first_line = lines[0];
+        let file_path = &first_line.0;
+        let line = first_line.1;
+        let line_number = line.1;
+        let file = std::fs::File::open(file_path)?;
+        let reader = std::io::BufReader::new(file);
+        reader
+            .lines()
+            .skip(line_number as usize - 1)
+            .take(max_instructions)
+            .enumerate()
+            .for_each(|(r, line)| {
+                if let Ok(line) = line {
+                    println!(
+                        "{}:{} {line}",
+                        file_path.display(),
+                        r + line_number as usize
+                    );
+                }
+            });
+        Ok(())
+    }
+
     fn print_assembly(&self, address: u64, max_instructions: usize) -> Result<()> {
         let bytes = self.read_memory_without_traps(address, max_instructions * 15)?;
         print_disassemble(&bytes, address, max_instructions);
@@ -370,12 +474,14 @@ impl Process {
     fn wait_on_signal(&self) -> Result<WaitStatus> {
         let reason = waitpid(self.pid, None)?;
         if let WaitStatus::Stopped(_, signal) = reason {
+            // Handle breakpoints
             if signal == nix::sys::signal::Signal::SIGTRAP {
                 let instr_begin = self.get_pc()? - 1;
                 if self.enabled_stoppoint_at_address(instr_begin) {
                     self.set_pc(instr_begin)?;
                 }
             }
+            self.notify_stop(reason);
         }
         Ok(reason)
     }
@@ -410,13 +516,25 @@ impl Process {
         Ok(())
     }
 
-    fn new(pid: Pid, terminate_on_end: bool) -> Self {
-        Process {
+    fn new(pid: Pid, terminate_on_end: bool) -> Result<Self> {
+        let proc = ProcfsProcess::new(pid.as_raw())?;
+        let path = proc.exe()?;
+        let memory_maps = proc.maps()?;
+        let code_section_offset = find_code_section_offset(memory_maps)
+            .ok_or_else(|| anyhow::anyhow!("Could not find code section offset"))?;
+        let target = Dwarf::new(&path)?;
+        Ok(Process {
             pid,
             terminate_on_end,
             state: ProcessState::Stopped,
             breakpoints: vec![],
-        }
+            target,
+            offset: code_section_offset,
+        })
+    }
+
+    fn notify_stop(&self, _reason: WaitStatus) {
+        // todo!()
     }
 }
 
@@ -427,4 +545,13 @@ impl Drop for Process {
             let _ = kill(self.pid);
         }
     }
+}
+
+fn find_code_section_offset(maps: MemoryMaps) -> Option<u64> {
+    for map in maps.iter() {
+        if map.perms.contains(MMPermissions::EXECUTE) {
+            return Some(map.address.0 - map.offset);
+        }
+    }
+    None
 }
